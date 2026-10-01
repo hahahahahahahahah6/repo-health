@@ -1,6 +1,7 @@
 """Smoke tests for repo-health: each builds a fixture repo in a tmp dir."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,27 @@ HEALTHY = {
     ".gitignore": "*.pyc\n",
     "main.py": "import os\nimport sys\nprint('hi')\n",
 }
+
+
+def make_git_repo(files, gitignore=""):
+    """Like make_repo, but a real git repo with files committed."""
+    d = make_repo(files)
+    subprocess.run(["git", "init"], cwd=d, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@e.com"],
+                   cwd=d, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "t"],
+                   cwd=d, check=True, capture_output=True)
+    if gitignore:
+        with open(os.path.join(d, ".gitignore"), "w") as f:
+            f.write(gitignore)
+    subprocess.run(["git", "add", "-A"], cwd=d, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"],
+                   cwd=d, check=True, capture_output=True)
+    return d
+
+
+GIT = shutil.which("git")
+needs_git = unittest.skipIf(GIT is None, "git binary not available")
 
 
 class TestRepoHealth(unittest.TestCase):
@@ -144,6 +166,57 @@ class TestRepoHealth(unittest.TestCase):
             cwd=d,
         )
         self.assertEqual(r.returncode, 0, r.stdout)
+
+
+@needs_git
+class TestGitAware(unittest.TestCase):
+    """File discovery via `git ls-files`: .gitignore must be respected."""
+
+    def test_gitignored_env_not_flagged(self):
+        d = make_git_repo(
+            dict(HEALTHY, **{".env": "API_KEY=supersecret\n"}),
+            gitignore=".env\n",
+        )
+        r = run_cli(d)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("FAIL", r.stdout)
+
+    def test_tracked_env_still_flagged(self):
+        # A .env that is actually committed is the real danger: still FAIL.
+        d = make_git_repo(dict(HEALTHY, **{".env": "API_KEY=x\n"}))
+        r = run_cli(d)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(".env", r.stdout)
+
+    def test_secrets_py_not_flagged_by_name(self):
+        d = make_git_repo(
+            dict(HEALTHY, **{"secrets.py": "import secrets\ntoken = secrets.token_hex(8)\n"})
+        )
+        r = run_cli(d)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("secrets.py", r.stdout)
+
+    def test_secret_named_non_source_still_flagged(self):
+        d = make_git_repo(dict(HEALTHY, **{"client_secret.json": "{}\n"}))
+        r = run_cli(d)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("client_secret.json", r.stdout)
+
+    def test_venv_imports_not_counted(self):
+        d = make_git_repo(
+            dict(HEALTHY, **{".venv/lib/pkg.py": "import requests\n"}),
+            gitignore=".venv/\n",
+        )
+        r = run_cli(d)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("third-party imports", r.stdout)
+
+    def test_stdlib_names_available(self):
+        sys.path.insert(0, os.path.dirname(CLI))
+        import repo_health
+        self.assertTrue(len(repo_health.STDLIB_MODULE_NAMES) > 50)
+        for mod in ("os", "sys", "json", "re", "secrets"):
+            self.assertIn(mod, repo_health.STDLIB_MODULE_NAMES)
 
 
 if __name__ == "__main__":

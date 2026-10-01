@@ -14,13 +14,62 @@ import fnmatch
 import json
 import os
 import re
+import subprocess
 import sys
 from typing import Any
 
 VERSION = "0.1.0"
 
 LICENSE_NAMES = {"license", "licence", "copying"}
-SECRET_PATTERNS = (".env", "*.pem", "*.key", "id_rsa*", "*secret*")
+# Name patterns that are suspicious on their own.
+SECRET_PATTERNS = (".env", "*.pem", "*.key", "id_rsa*", "*credentials*")
+# "*secret*" only counts for non-source files: secrets.py / secret.py are
+# ordinary module names (stdlib even has a `secrets` module).
+SECRET_NAME_RE = re.compile(r"secret", re.IGNORECASE)
+SOURCE_EXTS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs",
+    ".java", ".rb", ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".swift",
+    ".kt", ".scala", ".sh", ".pl", ".pm",
+}
+
+try:
+    STDLIB_MODULE_NAMES = sys.stdlib_module_names
+except AttributeError:  # Python < 3.10: curated fallback of common modules
+    STDLIB_MODULE_NAMES = frozenset({
+        "abc", "argparse", "array", "ast", "asyncio", "base64", "binascii",
+        "bisect", "builtins", "bz2", "calendar", "cgi", "cgitb", "chunk",
+        "cmath", "cmd", "code", "codecs", "codeop", "collections",
+        "colorsys", "compileall", "concurrent", "configparser",
+        "contextlib", "contextvars", "copy", "copyreg", "cProfile",
+        "crypt", "csv", "ctypes", "curses", "dataclasses", "datetime",
+        "dbm", "decimal", "difflib", "dis", "doctest", "email", "encodings",
+        "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
+        "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
+        "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
+        "heapq", "hmac", "html", "http", "idlelib", "imaplib", "imghdr",
+        "imp", "importlib", "inspect", "io", "ipaddress", "itertools",
+        "json", "keyword", "lib2to3", "linecache", "locale", "logging",
+        "lzma", "mailbox", "mailcap", "marshal", "math", "mimetypes",
+        "mmap", "modulefinder", "multiprocessing", "netrc", "nis",
+        "nntplib", "numbers", "operator", "optparse", "os", "ossaudiodev",
+        "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
+        "platform", "plistlib", "poplib", "posix", "pprint", "profile",
+        "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue",
+        "quopri", "random", "re", "readline", "reprlib", "resource",
+        "rlcompleter", "runpy", "sched", "secrets", "select",
+        "selectors", "shelve", "shlex", "shutil", "signal", "site",
+        "smtpd", "smtplib", "sndhdr", "socket", "socketserver",
+        "sqlite3", "ssl", "stat", "statistics", "string", "stringprep",
+        "struct", "subprocess", "sunau", "symtable", "sys", "sysconfig",
+        "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile", "termios",
+        "test", "textwrap", "threading", "time", "timeit", "tkinter",
+        "token", "tokenize", "trace", "traceback", "tracemalloc", "tty",
+        "turtle", "turtledemo", "types", "typing", "unicodedata",
+        "unittest", "urllib", "uu", "uuid", "venv", "warnings", "wave",
+        "weakref", "webbrowser", "wsgiref", "xdrlib", "xml", "xmlrpc",
+        "zipapp", "zipfile", "zipimport", "zlib", "zoneinfo",
+        "_thread", "__future__",
+    })
 FAT_BYTES = 1024 * 1024
 TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
 IMPORT_RE = re.compile(
@@ -30,13 +79,71 @@ TOP_LEVEL_STDLIB_EXEMPT = {"__future__"}
 
 
 def iter_files(root: str):
-    """Yield paths relative to root, skipping .git."""
+    """Yield paths relative to root, skipping .git (walk fallback)."""
     for dirpath, dirnames, filenames in os.walk(root):
         if ".git" in dirnames:
             dirnames.remove(".git")
         for name in filenames:
             full = os.path.join(dirpath, name)
             yield os.path.relpath(full, root)
+
+
+def _git_files(root: str):
+    """Files as git sees them (tracked + untracked-but-not-ignored),
+    as paths relative to `root`. Returns None when git can't answer
+    (not a repo, git missing), in which case callers fall back to a walk.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+        if top.returncode != 0:
+            return None
+        toplevel = top.stdout.strip()
+        proc = subprocess.run(
+            ["git", "-C", toplevel, "ls-files", "-z", "--full-name",
+             "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        rel_root = os.path.relpath(root, toplevel)
+        names = []
+        for p in proc.stdout.decode("utf-8", "replace").split("\x00"):
+            if not p:
+                continue
+            if rel_root == ".":
+                names.append(p)
+            elif p == rel_root or p.startswith(rel_root + "/"):
+                names.append(os.path.relpath(p, rel_root))
+        return names
+    except OSError:
+        return None
+
+
+def list_files(root: str):
+    """File discovery: ask git first (respects .gitignore), walk on fallback."""
+    git_names = _git_files(root)
+    if git_names is not None:
+        return git_names
+    return list(iter_files(root))
+
+
+def is_secret_name(name: str) -> bool:
+    """True if the filename alone is suspicious.
+
+    `.env` / `*.pem` / `*.key` / `id_rsa*` / `*credentials*` always count.
+    `*secret*` only counts for non-source files: secrets.py / secret.py are
+    ordinary module names, never proof of a committed secret.
+    """
+    base = os.path.basename(name)
+    for pat in SECRET_PATTERNS:
+        if fnmatch.fnmatch(base, pat):
+            return True
+    if SECRET_NAME_RE.search(base):
+        return os.path.splitext(base)[1].lower() not in SOURCE_EXTS
+    return False
 
 
 def looks_binary(full: str, size: int) -> bool:
@@ -100,7 +207,7 @@ def extract_imports(full: str, size: int) -> set[str]:
 
 
 def check(root: str) -> list[dict[str, Any]]:
-    names = list(iter_files(root))
+    names = list_files(root)
     results: list[dict[str, Any]] = []
 
     # 1. license
@@ -134,14 +241,7 @@ def check(root: str) -> list[dict[str, Any]]:
     )
 
     # 4. secrets — flag names only, never print contents
-    flagged = sorted(
-        {
-            n
-            for n in names
-            for pat in SECRET_PATTERNS
-            if fnmatch.fnmatch(os.path.basename(n), pat)
-        }
-    )
+    flagged = sorted({n for n in names if is_secret_name(n)})
     results.append(
         {
             "check": "secrets",
@@ -203,7 +303,7 @@ def check(root: str) -> list[dict[str, Any]]:
     third_party: set[str] = set()
     for n in pyfiles:
         for mod in extract_imports(os.path.join(root, n), _size(root, n)):
-            if mod in TOP_LEVEL_STDLIB_EXEMPT or mod in sys.stdlib_module_names:
+            if mod in TOP_LEVEL_STDLIB_EXEMPT or mod in STDLIB_MODULE_NAMES:
                 continue
             if mod in local:
                 continue

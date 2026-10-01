@@ -14,10 +14,13 @@ The last thing you check before you hit publish. The stuff you always forget.
 ## Install
 
 ```bash
-pip install repo-health
+git clone https://github.com/hahahahahahahahah6/repo-health
+cd repo-health
+python3 repo_health.py
 ```
 
-Or run it straight from source — it's a single file with no dependencies:
+(Not on PyPI — the `repo-health` name there belongs to an unrelated project.
+Run it straight from source — it's a single file with no dependencies:)
 
 ```bash
 python3 repo_health.py
@@ -26,14 +29,14 @@ python3 repo_health.py
 ## Usage
 
 ```bash
-repo-health [path]       # defaults to current directory
-repo-health . --json     # machine-readable report
+python3 repo_health.py [path]       # defaults to current directory
+python3 repo_health.py . --json     # machine-readable report
 ```
 
 ### Example
 
 ```
-$ repo-health .
+$ python3 repo_health.py .
 repo-health 0.1.0 — /home/hao/projects/agent-guard
 
 [✓ PASS] license       LICENSE
